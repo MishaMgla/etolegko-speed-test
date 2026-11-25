@@ -46,14 +46,16 @@ function expectFailure(args, message) {
   return assert.rejects(runCli(...args), { code: 1, stdout: '', stderr: message });
 }
 
-test('downloads ten complete binary responses sequentially and reports consistent metrics', async (t) => {
+test('downloads ten complete responses sequentially over new sockets and reports consistent metrics', async (t) => {
   const received = [];
+  const sockets = new Set();
   const headerDelayMs = 20;
   const tailDelayMs = 30;
   let active = 0;
   let peakActive = 0;
   const url = await serve(t, async (request, response) => {
     received.push([request.method, request.url]);
+    sockets.add(request.socket);
     const firstChunkBytes = received.length * 1024;
     active += 1;
     peakActive = Math.max(peakActive, active);
@@ -70,6 +72,7 @@ test('downloads ten complete binary responses sequentially and reports consisten
   const metrics = readMetrics(stdout);
   assert.equal(stderr, '');
   assert.deepEqual(received, Array.from({ length: 10 }, () => ['GET', '/file?sample=1']));
+  assert.equal(sockets.size, 10);
   assert.equal(peakActive, 1);
   assert.equal(metrics.requests, 10);
   assert.equal(metrics.bytes, 61440);

@@ -14,7 +14,7 @@ async function download(get, url) {
 
   try {
     const response = await new Promise((resolve, reject) => {
-      get(url, { signal }, resolve)
+      get(url, { agent: false, signal }, resolve)
         .once('error', reject)
         .once('upgrade', (response, socket) => {
           socket.destroy();
