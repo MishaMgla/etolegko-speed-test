@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 const script = fileURLToPath(new URL('../measure-download.mjs', import.meta.url));
+const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGPgEpH7DwABpAE8k4sOtwAAAABJRU5ErkJggg==', 'base64');
 
 function runCli(...args) {
   return exec(process.execPath, [script, ...args], { timeout: 5000 });
@@ -91,6 +92,68 @@ test('reports zero downloaded bytes and zero speed for empty responses', async (
   const { bytes, speed } = readMetrics(stdout);
   assert.equal(bytes, 0);
   assert.equal(speed, 0);
+});
+
+test('validates PNG on all ten responses without Content-Length', async (t) => {
+  const encodings = [];
+  const url = await serve(t, (request, response) => {
+    encodings.push(request.headers['accept-encoding']);
+    response.write(png.subarray(0, 12));
+    response.end(png.subarray(12));
+  });
+
+  const { stdout } = await runCli(url, '--format', 'png');
+  assert.deepEqual(encodings, Array(10).fill('identity'));
+  assert.equal(readMetrics(stdout).bytes, 10 * png.length);
+});
+
+test('detects damaged PNG image data on the ninth response', async (t) => {
+  const corrupt = Buffer.from(png);
+  corrupt[corrupt.indexOf('IDAT') + 7] ^= 1;
+  let requests = 0;
+  const url = await serve(t, (_, response) => {
+    requests += 1;
+    response.setHeader('Content-Length', png.length);
+    response.end(requests === 9 ? corrupt : png);
+  });
+
+  await expectFailure([url, '--format', 'png'], /Request 9 failed: invalid PNG/);
+  assert.equal(requests, 9);
+});
+
+test('rejects a PNG without IEND despite a correctly framed HTTP body', async (t) => {
+  const truncated = png.subarray(0, -12);
+  const url = await serve(t, (_, response) => {
+    response.setHeader('Content-Length', truncated.length);
+    response.end(truncated);
+  });
+
+  await expectFailure([url, '--format', 'png'], /Request 1 failed: invalid PNG/);
+});
+
+test('rejects HTML labeled as a PNG', async (t) => {
+  const url = await serve(t, (_, response) => {
+    response.writeHead(200, { 'Content-Type': 'image/png' }).end('<h1>Error</h1>');
+  });
+
+  await expectFailure([url, '--format', 'png'], /Request 1 failed: invalid PNG/);
+});
+
+test('rejects PNG image data that cannot be decoded even with matching CRCs', async (t) => {
+  const undecodable = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQAAAAAAAAAAAAAAAAAQvdO+gAAAABJRU5ErkJggg==', 'base64');
+  const url = await serve(t, (_, response) => response.end(undecodable));
+
+  await expectFailure([url, '--format', 'png'], /Request 1 failed: invalid PNG/);
+});
+
+test('rejects partial or HTTP-compressed responses in PNG mode', async (t) => {
+  const partial = await serve(t, (_, response) => response.writeHead(206).end(png));
+  await expectFailure([partial, '--format', 'png'], /Request 1 failed: HTTP 206/);
+
+  const encoded = await serve(t, (_, response) => {
+    response.writeHead(200, { 'Content-Encoding': 'gzip' }).end(png);
+  });
+  await expectFailure([encoded, '--format', 'png'], /Request 1 failed: PNG validation requires an unencoded response/);
 });
 
 test('finishes a download that exceeds the idle timeout while headers and chunks keep arriving', async (t) => {
