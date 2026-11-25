@@ -15,6 +15,16 @@ function runCli(...args) {
   return exec(process.execPath, [script, ...args], { timeout: 5000 });
 }
 
+function runCliWithShortTimeout(url) {
+  const preload = `
+    const setTimer = globalThis.setTimeout;
+    globalThis.setTimeout = (callback, ms, ...args) =>
+      setTimer(callback, ms === 60_000 ? 600 : ms, ...args);
+  `;
+  const moduleUrl = `data:text/javascript,${encodeURIComponent(preload)}`;
+  return exec(process.execPath, ['--import', moduleUrl, script, url], { timeout: 5000 });
+}
+
 async function serve(t, handler) {
   const server = createServer(handler).listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -78,6 +88,42 @@ test('reports zero downloaded bytes and zero speed for empty responses', async (
   const { bytes, speed } = readMetrics(stdout);
   assert.equal(bytes, 0);
   assert.equal(speed, 0);
+});
+
+test('finishes a download that exceeds the idle timeout while headers and chunks keep arriving', async (t) => {
+  let requests = 0;
+  const url = await serve(t, async (_, response) => {
+    requests += 1;
+    if (requests === 1) {
+      await delay(350);
+      response.flushHeaders();
+      await delay(350);
+      response.write('a');
+      await delay(350);
+    }
+    response.end('b');
+  });
+
+  const { stdout } = await runCliWithShortTimeout(url);
+  assert.equal(requests, 10);
+  assert.equal(readMetrics(stdout).bytes, 11);
+});
+
+test('aborts idle requests before headers and during the body', async (t) => {
+  for (const startBody of [false, true]) {
+    let requests = 0;
+    const url = await serve(t, (_, response) => {
+      requests += 1;
+      if (startBody) response.write('partial');
+    });
+
+    await assert.rejects(runCliWithShortTimeout(url), {
+      code: 1,
+      stdout: '',
+      stderr: /Request 1 failed: timed out after 60 seconds without response progress/,
+    });
+    assert.equal(requests, 1);
+  }
 });
 
 test('rejects missing, extra, malformed, and non-HTTP arguments', async () => {

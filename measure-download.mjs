@@ -3,28 +3,42 @@ import { get as httpsGet } from 'node:https';
 import { performance } from 'node:perf_hooks';
 
 const requestCount = 10;
-const requestTimeoutMs = 60_000;
+const idleTimeoutMs = 60_000;
 
-async function download(get, url, signal) {
-  const response = await new Promise((resolve, reject) => {
-    get(url, { signal }, resolve)
-      .once('error', reject)
-      .once('upgrade', (response, socket) => {
-        socket.destroy();
-        reject(new Error(`HTTP ${response.statusCode}`));
-      });
-  });
+async function download(get, url) {
+  const controller = new AbortController();
+  const { signal } = controller;
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`timed out after ${idleTimeoutMs / 1000} seconds without response progress`));
+  }, idleTimeoutMs);
 
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    response.destroy();
-    throw new Error(`HTTP ${response.statusCode}`);
+  try {
+    const response = await new Promise((resolve, reject) => {
+      get(url, { signal }, resolve)
+        .once('error', reject)
+        .once('upgrade', (response, socket) => {
+          socket.destroy();
+          reject(new Error(`HTTP ${response.statusCode}`));
+        });
+    });
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      response.destroy();
+      throw new Error(`HTTP ${response.statusCode}`);
+    }
+
+    timer.refresh();
+    let bytes = 0;
+    for await (const chunk of response) {
+      timer.refresh();
+      bytes += chunk.length;
+    }
+    return bytes;
+  } catch (error) {
+    throw signal.reason ?? error;
+  } finally {
+    clearTimeout(timer);
   }
-
-  let bytes = 0;
-  for await (const chunk of response) {
-    bytes += chunk.length;
-  }
-  return bytes;
 }
 
 async function main(args) {
@@ -39,14 +53,12 @@ async function main(args) {
   let totalMs = 0;
 
   for (let attempt = 1; attempt <= requestCount; attempt += 1) {
-    const signal = AbortSignal.timeout(requestTimeoutMs);
     const start = performance.now();
     try {
-      totalBytes += await download(get, url, signal);
+      totalBytes += await download(get, url);
       totalMs += performance.now() - start;
     } catch (error) {
-      const reason = signal.aborted ? 'timed out after 60 seconds' : error.message;
-      throw new Error(`Request ${attempt} failed: ${reason}`);
+      throw new Error(`Request ${attempt} failed: ${error.message}`);
     }
   }
 
