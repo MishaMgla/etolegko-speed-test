@@ -86,14 +86,18 @@ test('rejects missing, extra, malformed, and non-HTTP arguments', async () => {
   }
 });
 
-test('stops after the first HTTP error', async (t) => {
+test('stops after an HTTP error and discards metrics from earlier successes', async (t) => {
   let requests = 0;
   const url = await serve(t, (_, response) => {
     requests += 1;
-    response.writeHead(404).end('Missing');
+    if (requests === 3) {
+      response.writeHead(404).end('Missing');
+      return;
+    }
+    response.end('Available');
   });
-  await expectFailure([url], /HTTP 404/);
-  assert.equal(requests, 1);
+  await expectFailure([url], /Request 3 failed: HTTP 404/);
+  assert.equal(requests, 3);
 });
 
 test('rejects a redirect without requesting its destination', async (t) => {
