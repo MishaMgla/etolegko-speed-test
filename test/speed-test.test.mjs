@@ -94,6 +94,74 @@ test('reports zero downloaded bytes and zero speed for empty responses', async (
   assert.equal(speed, 0);
 });
 
+test('auto-detects PNG, JPEG and WebP across chunk boundaries', async (t) => {
+  const { default: sharp } = await import('sharp');
+  const inputs = [png, await sharp(png).jpeg().toBuffer(), await sharp(png).webp().toBuffer()];
+  let count = 0;
+  const url = await serve(t, async (_, response) => {
+    const image = inputs[count++ % inputs.length];
+    response.writeHead(200, { 'Content-Type': 'text/plain' });
+    response.write(image.subarray(0, 2));
+    await delay(15);
+    response.end(image.subarray(2));
+  });
+
+  const { stdout } = await runCli(url, '--validate');
+  assert.equal(count, 10);
+  assert.match(stdout, /Validation: 10\/10 verified \(PNG, JPEG, WebP\); 0 not verified/);
+});
+
+test('reports unsupported, encoded, and partial downloads as not verified', async (t) => {
+  let count = 0;
+  const url = await serve(t, (_, response) => {
+    count += 1;
+    if (count === 1) {
+      response.end(png);
+    } else if (count === 2) {
+      response.writeHead(200, { 'Content-Encoding': 'gzip' }).end('encoded');
+    } else if (count === 3) {
+      response.writeHead(206).end(png);
+    } else {
+      response.end('%PDF-1.7\n');
+    }
+  });
+
+  const { stdout } = await runCli(url, '--validate');
+  assert.equal(count, 10);
+  assert.match(stdout, /Validation: 1\/10 verified \(PNG\); 9 not verified \(HTTP content encoding, HTTP 206, unsupported format\)/);
+});
+
+test('auto-validation detects truncated data after a supported image signature', async (t) => {
+  const { default: sharp } = await import('sharp');
+  const inputs = [['JPEG', await sharp(png).jpeg().toBuffer()], ['WebP', await sharp(png).webp().toBuffer()]];
+  for (const [format, image] of inputs) {
+    const url = await serve(t, (_, response) => response.end(image.subarray(0, -2)));
+    await expectFailure([url, '--validate'], new RegExp(`Request 1 failed: invalid ${format}`));
+  }
+});
+
+test('auto-validation reports animated PNG and WebP as not verified', async (t) => {
+  const apng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAABAAAAAQAAAAAAAAAAAAEACgAAWn8w0AAAAAxJREFUeJxj+M/AAAADAQEAyf6S7wAAABpmY1RMAAAAAQAAAAEAAAABAAAAAAAAAAAAAQAKAADBDNoEAAAAEGZkQVQAAAACeJxjYGD4DwABAwEAaL/t9AAAAABJRU5ErkJggg==', 'base64');
+  const { default: sharp } = await import('sharp');
+  const frames = Buffer.from([255, 0, 0, 0, 0, 255]);
+  const webp = await sharp(frames, { raw: { width: 1, height: 2, channels: 3, pageHeight: 1 } })
+    .webp({ delay: [100, 100] }).toBuffer();
+  let count = 0;
+  const url = await serve(t, (_, response) => response.end(count++ % 2 === 0 ? apng : webp));
+
+  const { stdout } = await runCli(url, '--validate');
+  assert.match(stdout, /Validation: 0\/10 verified; 10 not verified \(animated PNG is unsupported, animated WebP is unsupported\)/);
+});
+
+test('auto-validation skips a recognized file above the body limit', async () => {
+  const { collectImage } = await import('../validate-image.mjs');
+  const image = collectImage(false);
+  const block = Buffer.alloc(1_048_576);
+  image.add(png);
+  for (let i = 0; i < 64; i += 1) image.add(block);
+  assert.deepEqual(await image.finish(), { reason: 'body exceeds 64 MiB' });
+});
+
 test('validates PNG on all ten responses without Content-Length', async (t) => {
   const encodings = [];
   const url = await serve(t, (request, response) => {

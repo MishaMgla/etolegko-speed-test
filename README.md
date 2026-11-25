@@ -21,14 +21,18 @@ Total downloaded: 5770 bytes
 Download speed: 0.016177 MiB/s
 ```
 
-## Проверка PNG
+## Проверка формата
 
-Режим `--format png` проверяет каждый статический PNG, переданный без HTTP-сжатия. Нужен Node.js 22.2 или новее. Лимиты — 64 МиБ и 16 млн пикселей.
+Режим `--validate` определяет формат по байтам и проверяет статические PNG, JPEG и WebP. Нужен Node.js 22.2 или новее.
 
 ```sh
 npm ci
-node measure-download.mjs 'https://raw.githubusercontent.com/MishaMgla/etolegko-speed-test/main/docs/terminal-example.png' --format png
+node measure-download.mjs 'https://raw.githubusercontent.com/MishaMgla/etolegko-speed-test/main/docs/terminal-example.png' --validate
 ```
+
+Отчёт добавляет строку `Validation: 10/10 verified (PNG); 0 not verified`. Для HTML по адресу `https://example.com/` она будет `Validation: 0/10 verified; 10 not verified (unsupported format)`.
+
+Повреждённый файл распознанного формата завершает замер с ошибкой. `--format png` доступен для строгой проверки именно PNG.
 
 ## Ошибки
 
