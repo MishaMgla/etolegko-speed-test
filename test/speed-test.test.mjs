@@ -1,0 +1,125 @@
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
+import { performance } from 'node:perf_hooks';
+import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+const exec = promisify(execFile);
+const script = fileURLToPath(new URL('../measure-download.mjs', import.meta.url));
+
+function runCli(...args) {
+  return exec(process.execPath, [script, ...args], { timeout: 5000 });
+}
+
+async function serve(t, handler) {
+  const server = createServer(handler).listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  }));
+  return `http://127.0.0.1:${server.address().port}/file?sample=1`;
+}
+
+function readMetrics(stdout) {
+  const match = stdout.match(/^Requests: (\d+)\nAverage time: (\d+\.\d{3}) ms\nTotal downloaded: (\d+) bytes\nDownload speed: (\d+\.\d{6}) MiB\/s\r?\n$/);
+  assert.ok(match, stdout);
+  const [, requests, averageMs, bytes, speed] = match.map(Number);
+  return { requests, averageMs, bytes, speed };
+}
+
+function expectFailure(args, message) {
+  return assert.rejects(runCli(...args), { code: 1, stdout: '', stderr: message });
+}
+
+test('downloads ten complete binary responses sequentially and reports consistent metrics', async (t) => {
+  const received = [];
+  const headerDelayMs = 20;
+  const tailDelayMs = 30;
+  let active = 0;
+  let peakActive = 0;
+  const url = await serve(t, async (request, response) => {
+    received.push([request.method, request.url]);
+    const firstChunkBytes = received.length * 1024;
+    active += 1;
+    peakActive = Math.max(peakActive, active);
+    await delay(headerDelayMs);
+    response.write(Buffer.alloc(firstChunkBytes, 0xff));
+    await delay(tailDelayMs);
+    response.end(Buffer.alloc(512, 0x80));
+    active -= 1;
+  });
+
+  const start = performance.now();
+  const { stdout, stderr } = await runCli(url);
+  const elapsedMs = performance.now() - start;
+  const metrics = readMetrics(stdout);
+  assert.equal(stderr, '');
+  assert.deepEqual(received, Array.from({ length: 10 }, () => ['GET', '/file?sample=1']));
+  assert.equal(peakActive, 1);
+  assert.equal(metrics.requests, 10);
+  assert.equal(metrics.bytes, 61440);
+  assert.ok(metrics.averageMs >= headerDelayMs + tailDelayMs - 5, `Average time: ${metrics.averageMs} ms`);
+  assert.ok(metrics.averageMs * metrics.requests <= elapsedMs + 0.005);
+
+  const mebibytes = metrics.bytes / 1048576;
+  const fastest = mebibytes / ((metrics.averageMs - 0.0005) * 10 / 1000);
+  const slowest = mebibytes / ((metrics.averageMs + 0.0005) * 10 / 1000);
+  assert.ok(metrics.speed >= slowest - 0.0000005 && metrics.speed <= fastest + 0.0000005);
+});
+
+test('reports zero downloaded bytes and zero speed for empty responses', async (t) => {
+  const url = await serve(t, (_, response) => response.writeHead(204).end());
+  const { stdout } = await runCli(url);
+  const { bytes, speed } = readMetrics(stdout);
+  assert.equal(bytes, 0);
+  assert.equal(speed, 0);
+});
+
+test('rejects missing, extra, malformed, and non-HTTP arguments', async () => {
+  for (const args of [[], ['http://example.com', 'extra'], ['not a URL'], ['file:///tmp/file']]) {
+    await expectFailure(args, /Usage:/);
+  }
+});
+
+test('stops after the first HTTP error', async (t) => {
+  let requests = 0;
+  const url = await serve(t, (_, response) => {
+    requests += 1;
+    response.writeHead(404).end('Missing');
+  });
+  await expectFailure([url], /HTTP 404/);
+  assert.equal(requests, 1);
+});
+
+test('rejects a redirect without requesting its destination', async (t) => {
+  let requests = 0;
+  const url = await serve(t, (_, response) => {
+    requests += 1;
+    response.writeHead(302, { Location: '/redirected' }).end();
+  });
+  await expectFailure([url], /HTTP 302/);
+  assert.equal(requests, 1);
+});
+
+test('rejects an unsolicited protocol upgrade as an HTTP error', async (t) => {
+  const url = await serve(t, (_, response) => {
+    response.writeHead(101, { Connection: 'Upgrade', Upgrade: 'websocket' }).end();
+  });
+  await expectFailure([url], /HTTP 101/);
+});
+
+test('rejects a response whose connection closes before the whole body arrives', async (t) => {
+  let requests = 0;
+  const url = await serve(t, (_, response) => {
+    requests += 1;
+    response.writeHead(200, { 'Content-Length': 1024 });
+    response.write(Buffer.alloc(512), () => response.destroy());
+  });
+  await expectFailure([url], /Request 1 failed/);
+  assert.equal(requests, 1);
+});
